@@ -1,3 +1,4 @@
+// Modified to draw a synthetic oblique where a requested italic has no italic face.
 use anyhow::anyhow;
 use cocoa::appkit::CGFloat;
 use collections::{HashMap, HashSet};
@@ -13,13 +14,14 @@ use core_graphics::{
     color_space::CGColorSpace,
     context::{CGContext, CGTextDrawingMode},
     display::CGPoint,
+    geometry::CGAffineTransform,
 };
 use core_text::{
     font::CTFont,
     font_collection::CTFontCollectionRef,
     font_descriptor::{
-        CTFontDescriptor, kCTFontSlantTrait, kCTFontSymbolicTrait, kCTFontWeightTrait,
-        kCTFontWidthTrait,
+        CTFontDescriptor, SymbolicTraitAccessors, kCTFontSlantTrait, kCTFontSymbolicTrait,
+        kCTFontWeightTrait, kCTFontWidthTrait,
     },
     line::CTLine,
     string_attributes::kCTFontAttributeName,
@@ -53,6 +55,9 @@ use crate::open_type::apply_features_and_fallbacks;
 #[allow(non_upper_case_globals)]
 const kCGImageAlphaOnly: u32 = 7;
 
+/// Horizontal shear of a synthetic oblique: tan 14°, the slant cosmic-text uses.
+const OBLIQUE_SHEAR: f32 = 0.249_328;
+
 /// macOS text system using CoreText for font shaping.
 pub struct MacTextSystem(RwLock<MacTextSystemState>);
 
@@ -71,6 +76,11 @@ struct MacTextSystemState {
     font_ids_by_postscript_name: HashMap<String, FontId>,
     font_ids_by_font_key: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     postscript_names_by_font_id: HashMap<FontId, String>,
+    /// Upright fonts drawn with a synthetic slant: each oblique font shares its
+    /// upright font's outlines and metrics under its own ID, so shaping and
+    /// glyph caching stay per font.
+    oblique_ids: HashMap<FontId, FontId>,
+    upright_ids: HashMap<FontId, FontId>,
 }
 
 impl MacTextSystem {
@@ -84,6 +94,8 @@ impl MacTextSystem {
             font_ids_by_postscript_name: HashMap::default(),
             font_ids_by_font_key: HashMap::default(),
             postscript_names_by_font_id: HashMap::default(),
+            oblique_ids: HashMap::default(),
+            upright_ids: HashMap::default(),
         }))
     }
 }
@@ -167,7 +179,10 @@ impl PlatformTextSystem for MacTextSystem {
                 },
             )?;
 
-            let font_id = candidates[ix];
+            let mut font_id = candidates[ix];
+            if font.style != FontStyle::Normal && !lock.is_italic(font_id) {
+                font_id = lock.oblique_id(font_id);
+            }
             lock.font_selections.insert(font.clone(), font_id);
             Ok(font_id)
         }
@@ -410,6 +425,26 @@ impl MacTextSystemState {
         }
     }
 
+    fn is_italic(&self, font_id: FontId) -> bool {
+        self.upright_ids.contains_key(&font_id)
+            || self.fonts[font_id.0]
+                .native_font()
+                .symbolic_traits()
+                .is_italic()
+    }
+
+    /// The synthetic oblique of an upright font, registered on first use.
+    fn oblique_id(&mut self, upright_id: FontId) -> FontId {
+        if let Some(font_id) = self.oblique_ids.get(&upright_id) {
+            return *font_id;
+        }
+        let font_id = FontId(self.fonts.len());
+        self.fonts.push(self.fonts[upright_id.0].clone());
+        self.oblique_ids.insert(upright_id, font_id);
+        self.upright_ids.insert(font_id, upright_id);
+        font_id
+    }
+
     fn is_emoji(&self, font_id: FontId) -> bool {
         self.postscript_names_by_font_id
             .get(&font_id)
@@ -420,11 +455,15 @@ impl MacTextSystemState {
 
     fn raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
         let font = &self.fonts[params.font_id.0];
-        let scale = Transform2F::from_scale(params.scale_factor);
+        let mut transform = Transform2F::from_scale(params.scale_factor);
+        if self.upright_ids.contains_key(&params.font_id) {
+            // Raster bounds grow downward, so leaning the top right shears by -y.
+            transform = transform * Transform2F::row_major(1., -OBLIQUE_SHEAR, 0., 1., 0., 0.);
+        }
         let bounds: Bounds<DevicePixels> = bounds_from_rect_i(font.raster_bounds(
             params.glyph_id.0,
             params.font_size.into(),
-            scale,
+            transform,
             HintingOptions::None,
             font_kit::canvas::RasterizationOptions::GrayscaleAa,
         )?);
@@ -506,17 +545,25 @@ impl MacTextSystemState {
             } else {
                 cx.set_gray_fill_color(0.0, 1.0);
             }
+            // Shear about the glyph origin; the context's y axis points up.
+            cx.translate(
+                (subpixel_shift.x / params.scale_factor) as CGFloat,
+                (subpixel_shift.y / params.scale_factor) as CGFloat,
+            );
+            if self.upright_ids.contains_key(&params.font_id) {
+                cx.concat_ctm(CGAffineTransform::new(
+                    1.,
+                    0.,
+                    OBLIQUE_SHEAR as CGFloat,
+                    1.,
+                    0.,
+                    0.,
+                ));
+            }
             self.fonts[params.font_id.0]
                 .native_font()
                 .clone_with_font_size(f32::from(params.font_size) as CGFloat)
-                .draw_glyphs(
-                    &[params.glyph_id.0 as CGGlyph],
-                    &[CGPoint::new(
-                        (subpixel_shift.x / params.scale_factor) as CGFloat,
-                        (subpixel_shift.y / params.scale_factor) as CGFloat,
-                    )],
-                    cx,
-                );
+                .draw_glyphs(&[params.glyph_id.0 as CGGlyph], &[CGPoint::new(0., 0.)], cx);
 
             if params.is_emoji {
                 // Convert from RGBA with premultiplied alpha to BGRA with straight alpha.
@@ -534,6 +581,9 @@ impl MacTextSystemState {
         let mut string = CFMutableAttributedString::new();
         let mut max_ascent = 0.0f32;
         let mut max_descent = 0.0f32;
+        // Each run's UTF-16 end and whether it asks for italics; fallback
+        // fonts chosen inside an italic run need a slant of their own.
+        let mut italic_runs = SmallVec::<[(usize, bool); 8]>::new();
 
         {
             let mut text = text;
@@ -550,6 +600,7 @@ impl MacTextSystemState {
                 let length = utf16_end - utf16_start;
                 let cf_range = CFRange::init(utf16_start, length);
                 let font = &self.fonts[run.font_id.0];
+                italic_runs.push((utf16_end as usize, self.is_italic(run.font_id)));
 
                 let font_metrics = font.metrics();
                 let font_scale = f32::from(font_size) / font_metrics.units_per_em as f32;
@@ -584,7 +635,15 @@ impl MacTextSystemState {
                     .downcast::<CTFont>()
                     .unwrap()
             };
-            let font_id = self.id_for_native_font(font);
+            let mut font_id = self.id_for_native_font(font);
+            let wants_italic = run.string_indices().first().is_some_and(|&ix| {
+                let ix = usize::try_from(ix).unwrap_or_default();
+                let run_ix = italic_runs.partition_point(|&(end, _)| end <= ix);
+                italic_runs.get(run_ix).is_some_and(|&(_, italic)| italic)
+            });
+            if wants_italic && !self.is_italic(font_id) && !self.is_emoji(font_id) {
+                font_id = self.oblique_id(font_id);
+            }
 
             let glyphs = match runs.last_mut() {
                 Some(run) if run.font_id == font_id => &mut run.glyphs,
@@ -767,7 +826,9 @@ mod lenient_font_attributes {
 #[cfg(test)]
 mod tests {
     use crate::MacTextSystem;
-    use gpui::{FontRun, GlyphId, PlatformTextSystem, font, px};
+    use gpui::{
+        Font, FontRun, FontStyle, GlyphId, PlatformTextSystem, RenderGlyphParams, font, px,
+    };
 
     #[test]
     fn test_layout_line_bom_char() {
@@ -900,5 +961,81 @@ mod tests {
         let layout = fonts.layout_line(text, px(16.), font_runs);
         assert_eq!(layout.len, 0);
         assert!(layout.runs.is_empty());
+    }
+
+    #[test]
+    fn italic_without_an_italic_face_is_drawn_oblique() {
+        let fonts = MacTextSystem::new();
+        let italic = |family| Font {
+            style: FontStyle::Italic,
+            ..font(family)
+        };
+        let upright = fonts.font_id(&font("PingFang SC")).unwrap();
+        let oblique = fonts.font_id(&italic("PingFang SC")).unwrap();
+        assert_ne!(oblique, upright);
+        assert_eq!(
+            fonts.font_metrics(oblique).ascent,
+            fonts.font_metrics(upright).ascent
+        );
+
+        // The slant widens the raster without moving its origin row.
+        let glyph_id = fonts.glyph_for_char(upright, '中').unwrap();
+        let bounds = |font_id| {
+            fonts
+                .glyph_raster_bounds(&RenderGlyphParams {
+                    font_id,
+                    glyph_id,
+                    font_size: px(16.),
+                    subpixel_variant: Default::default(),
+                    scale_factor: 2.,
+                    is_emoji: false,
+                    subpixel_rendering: false,
+                    dilation: 0,
+                })
+                .unwrap()
+        };
+        assert!(bounds(oblique).size.width > bounds(upright).size.width);
+        assert_eq!(bounds(oblique).size.height, bounds(upright).size.height);
+
+        // The slant leaves shaping alone.
+        let positions = |layout: &gpui::LineLayout| {
+            layout
+                .runs
+                .iter()
+                .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.position))
+                .collect::<Vec<_>>()
+        };
+        let text = "中文";
+        let layout = |font_id| {
+            fonts.layout_line(
+                text,
+                px(16.),
+                &[FontRun {
+                    font_id,
+                    len: text.len(),
+                }],
+            )
+        };
+        assert_eq!(layout(oblique).runs[0].font_id, oblique);
+        assert_eq!(positions(&layout(oblique)), positions(&layout(upright)));
+
+        // A fallback chosen inside an italic run is slanted as well.
+        let text = "a中";
+        let layout = |font_id| {
+            fonts.layout_line(
+                text,
+                px(16.),
+                &[FontRun {
+                    font_id,
+                    len: text.len(),
+                }],
+            )
+        };
+        let fallback = |layout: gpui::LineLayout| layout.runs.last().unwrap().font_id;
+        let plain = fallback(layout(fonts.font_id(&font("Helvetica")).unwrap()));
+        let slanted = fallback(layout(fonts.font_id(&italic("Helvetica")).unwrap()));
+        let state = fonts.0.read();
+        assert!(!state.upright_ids.contains_key(&plain));
+        assert_eq!(state.upright_ids.get(&slanted), Some(&plain));
     }
 }
