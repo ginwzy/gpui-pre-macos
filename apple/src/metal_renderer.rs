@@ -516,7 +516,7 @@ impl MetalRenderer {
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
     ) -> Result<metal::CommandBuffer> {
-        if scene.paths.is_empty() {
+        if !scene.has_paths() {
             self.path_intermediate_texture = None;
             self.path_intermediate_msaa_texture = None;
         } else if self
@@ -534,7 +534,7 @@ impl MetalRenderer {
             &self.instance_buffer_pool,
             self.is_unified_memory,
         );
-        let instance_bindings = write_instances(scene, &mut writer).with_context(|| {
+        let bindings = Self::prepare_bindings(scene, &mut writer).with_context(|| {
             format!(
                 "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces",
                 scene.paths.len(),
@@ -546,13 +546,8 @@ impl MetalRenderer {
                 scene.surfaces.len(),
             )
         })?;
-        let command_buffer = self.draw_primitives_to_texture(
-            scene,
-            &instance_bindings,
-            &mut writer,
-            texture,
-            viewport_size,
-        )?;
+        let command_buffer =
+            self.draw_primitives_to_texture(scene, &bindings, texture, viewport_size)?;
 
         let instance_buffer_pool = self.instance_buffer_pool.clone();
         let instance_buffer = Cell::new(Some(writer.finish()));
@@ -691,8 +686,7 @@ impl MetalRenderer {
     fn draw_primitives_to_texture(
         &mut self,
         scene: &Scene,
-        instance_bindings: &InstanceBindings,
-        writer: &mut InstanceBufferWriter,
+        bindings: &clip::Bindings,
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
     ) -> Result<metal::CommandBuffer> {
@@ -710,68 +704,151 @@ impl MetalRenderer {
         let mut surface_ix = 0;
         self.draw_scene(
             scene,
-            instance_bindings,
-            writer,
+            bindings,
             &target,
+            &[target.bounds()],
             command_buffer,
             &mut surface_ix,
-            if self.opaque { 1. } else { 0. },
+            Some(if self.opaque { 1. } else { 0. }),
         )?;
         self.clip_surfaces.truncate(surface_ix);
         Ok(command_buffer.to_owned())
     }
 
+    fn prepare_bindings(
+        scene: &Scene,
+        writer: &mut InstanceBufferWriter,
+    ) -> Result<clip::Bindings> {
+        let instances = write_instances(scene, writer)?;
+        let batches: Vec<_> = scene.batches().collect();
+        let mut paths = Vec::new();
+        for batch in &batches {
+            if let PrimitiveBatch::Paths(range) = batch {
+                paths.push((
+                    range.start,
+                    Self::write_paths(&scene.paths[range.clone()], writer)?,
+                ));
+            }
+        }
+        let children = scene
+            .composites
+            .iter()
+            .map(|c| Self::prepare_bindings(c.scene(), writer))
+            .collect::<Result<_>>()?;
+        Ok(clip::Bindings {
+            instances,
+            batches,
+            paths,
+            children,
+        })
+    }
+
     fn draw_scene(
         &mut self,
         scene: &Scene,
-        instance_bindings: &InstanceBindings,
-        writer: &mut InstanceBufferWriter,
+        bindings: &clip::Bindings,
         target: &clip::Target,
+        scissors: &[Bounds<ScaledPixels>],
         command_buffer: &metal::CommandBufferRef,
         surface_ix: &mut usize,
-        alpha: f64,
+        clear: Option<f64>,
     ) -> Result<()> {
-        let composites =
-            self.prepare_children(scene, target, writer, command_buffer, surface_ix)?;
+        let instance_bindings = &bindings.instances;
         let viewport_size = target.viewport;
-        let mut command_encoder = new_command_encoder_for_texture(
-            command_buffer,
-            &target.texture,
-            viewport_size,
-            Some(metal::MTLClearColor::new(0., 0., 0., alpha)),
-        );
-
-        for batch in scene.batches() {
-            match batch {
-                PrimitiveBatch::Shadows(range) => {
-                    self.draw_shadows(range, instance_bindings, viewport_size, command_encoder)
+        let start = |clear: Option<f64>| {
+            new_command_encoder_for_texture(
+                command_buffer,
+                &target.texture,
+                viewport_size,
+                clear.map(|alpha| metal::MTLClearColor::new(0., 0., 0., alpha)),
+            )
+        };
+        let mut command_encoder = start(clear);
+        for batch in &bindings.batches {
+            if let PrimitiveBatch::Composites(range) = batch {
+                command_encoder.end_encoding();
+                for ix in range.clone() {
+                    let composite = &scene.composites[ix];
+                    let tiles = composite.tiles(target.bounds());
+                    let intersect = |regions: &[Bounds<ScaledPixels>]| -> Vec<_> {
+                        regions
+                            .iter()
+                            .flat_map(|r| scissors.iter().map(move |s| r.intersect(s)))
+                            .filter(|r| !r.is_empty())
+                            .collect()
+                    };
+                    let direct = intersect(tiles.direct());
+                    if !direct.is_empty() {
+                        self.draw_scene(
+                            composite.scene(),
+                            &bindings.children[ix],
+                            target,
+                            &direct,
+                            command_buffer,
+                            surface_ix,
+                            None,
+                        )?;
+                    }
+                    for bounds in intersect(tiles.isolated()) {
+                        let prepared = self.prepare_composite(composite, bounds, *surface_ix);
+                        *surface_ix += 1;
+                        self.draw_scene(
+                            composite.scene(),
+                            &bindings.children[ix],
+                            &prepared.target,
+                            &[bounds],
+                            command_buffer,
+                            surface_ix,
+                            Some(0.),
+                        )?;
+                        let encoder = start(None);
+                        target.scissor(bounds, encoder);
+                        self.draw_composite(&prepared, encoder);
+                        encoder.end_encoding();
+                    }
                 }
-                PrimitiveBatch::Quads(range) => {
-                    self.draw_quads(range, instance_bindings, viewport_size, command_encoder)
+                command_encoder = start(None);
+                continue;
+            }
+            if let PrimitiveBatch::Paths(range) = batch {
+                let paths = &bindings
+                    .paths
+                    .iter()
+                    .find(|(start, _)| *start == range.start)
+                    .expect("path batch uploaded")
+                    .1;
+                command_encoder.end_encoding();
+                self.draw_paths_to_intermediate(paths, viewport_size, command_buffer, target)?;
+                command_encoder = start(None);
+            }
+            for &bounds in scissors {
+                let visible = scene.visible_range(batch, bounds);
+                if visible.is_empty() {
+                    continue;
                 }
-                PrimitiveBatch::Paths(range) => {
-                    let paths = &scene.paths[range];
-                    command_encoder.end_encoding();
-
-                    let did_draw = self.draw_paths_to_intermediate(
-                        paths,
-                        writer,
+                target.scissor(bounds, command_encoder);
+                match batch {
+                    PrimitiveBatch::Shadows(_) => self.draw_shadows(
+                        visible.clone(),
+                        instance_bindings,
                         viewport_size,
-                        command_buffer,
-                        target,
-                    )?;
-
-                    command_encoder = new_command_encoder_for_texture(
-                        command_buffer,
-                        &target.texture,
+                        command_encoder,
+                    ),
+                    PrimitiveBatch::Quads(_) => self.draw_quads(
+                        visible.clone(),
+                        instance_bindings,
                         viewport_size,
-                        None,
-                    );
-
-                    if did_draw {
+                        command_encoder,
+                    ),
+                    PrimitiveBatch::Paths(range) => {
+                        let paths = &bindings
+                            .paths
+                            .iter()
+                            .find(|(start, _)| *start == range.start)
+                            .expect("path batch uploaded")
+                            .1;
                         if let Err(error) = self.draw_paths_from_intermediate(
                             paths,
-                            writer,
                             viewport_size,
                             command_encoder,
                             target,
@@ -780,76 +857,94 @@ impl MetalRenderer {
                             return Err(error);
                         }
                     }
-                }
-                PrimitiveBatch::Underlines(range) => {
-                    self.draw_underlines(range, instance_bindings, viewport_size, command_encoder)
-                }
-                PrimitiveBatch::MonochromeSprites { texture_id, range } => self
-                    .draw_monochrome_sprites(
-                        texture_id,
-                        range,
+                    PrimitiveBatch::Underlines(_) => self.draw_underlines(
+                        visible.clone(),
                         instance_bindings,
                         viewport_size,
                         command_encoder,
                     ),
-                PrimitiveBatch::PolychromeSprites { texture_id, range } => self
-                    .draw_polychrome_sprites(
-                        texture_id,
-                        range,
+                    PrimitiveBatch::MonochromeSprites { texture_id, .. } => self
+                        .draw_monochrome_sprites(
+                            *texture_id,
+                            visible.clone(),
+                            instance_bindings,
+                            viewport_size,
+                            command_encoder,
+                        ),
+                    PrimitiveBatch::PolychromeSprites { texture_id, .. } => self
+                        .draw_polychrome_sprites(
+                            *texture_id,
+                            visible.clone(),
+                            instance_bindings,
+                            viewport_size,
+                            command_encoder,
+                        ),
+                    PrimitiveBatch::Surfaces(_) => self.draw_surfaces(
+                        &scene.surfaces[visible.clone()],
+                        visible.start,
                         instance_bindings,
                         viewport_size,
                         command_encoder,
                     ),
-                PrimitiveBatch::Surfaces(range) => self.draw_surfaces(
-                    &scene.surfaces[range.clone()],
-                    range.start,
-                    instance_bindings,
-                    viewport_size,
-                    command_encoder,
-                ),
-                PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
-                PrimitiveBatch::Composites(range) => {
-                    for ix in range {
-                        if let Some(prepared) = &composites[ix] {
-                            self.draw_composite(prepared, command_encoder);
-                        }
-                    }
+                    PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
+                    PrimitiveBatch::Composites(_) => unreachable!(),
                 }
             }
         }
-
         command_encoder.end_encoding();
-
         Ok(())
     }
 
-    fn draw_paths_to_intermediate(
-        &self,
+    fn write_paths(
         paths: &[Path<ScaledPixels>],
         writer: &mut InstanceBufferWriter,
-        viewport_size: Viewport,
-        command_buffer: &metal::CommandBufferRef,
-        target: &clip::Target,
-    ) -> Result<bool> {
-        if paths.is_empty() {
-            return Ok(false);
-        }
-        let intermediate_texture = target
-            .paths
-            .as_ref()
-            .context("missing path intermediate texture")?;
-
+    ) -> Result<PathBindings> {
         let mut vertices = Vec::new();
         for path in paths {
             vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
                 xy_position: v.xy_position,
                 st_position: v.st_position,
                 color: path.color,
-                bounds: path.bounds.intersect(&path.content_mask.bounds),
+                bounds: path.clipped_bounds(),
             }));
         }
-        let vertex_instance_bindings = writer.write(&vertices)?;
+        let first = &paths[0];
+        let sprites: Vec<PathSprite> = if paths.last().unwrap().order == first.order {
+            paths
+                .iter()
+                .map(|p| PathSprite {
+                    bounds: p.clipped_bounds(),
+                })
+                .collect()
+        } else {
+            let bounds = paths
+                .iter()
+                .skip(1)
+                .fold(first.clipped_bounds(), |b, p| b.union(&p.clipped_bounds()));
+            vec![PathSprite { bounds }]
+        };
+        Ok(PathBindings {
+            vertices: writer.write(&vertices)?,
+            vertex_count: vertices.len() as u64,
+            sprites: writer.write(&sprites)?,
+            sprite_count: sprites.len() as u64,
+        })
+    }
 
+    fn draw_paths_to_intermediate(
+        &self,
+        paths: &PathBindings,
+        viewport_size: Viewport,
+        command_buffer: &metal::CommandBufferRef,
+        target: &clip::Target,
+    ) -> Result<bool> {
+        if paths.vertex_count == 0 {
+            return Ok(false);
+        }
+        let intermediate_texture = target
+            .paths
+            .as_ref()
+            .context("missing path intermediate texture")?;
         let render_pass_descriptor = metal::RenderPassDescriptor::new();
         let color_attachment = render_pass_descriptor
             .color_attachments()
@@ -876,8 +971,8 @@ impl MetalRenderer {
         command_encoder.set_render_pipeline_state(&self.paths_rasterization_pipeline_state);
         command_encoder.set_vertex_buffer(
             PathRasterizationInputIndex::Vertices as u64,
-            Some(&vertex_instance_bindings.buffer),
-            vertex_instance_bindings.offset as u64,
+            Some(&paths.vertices.buffer),
+            paths.vertices.offset as u64,
         );
         command_encoder.set_vertex_bytes(
             PathRasterizationInputIndex::ViewportSize as u64,
@@ -886,14 +981,10 @@ impl MetalRenderer {
         );
         command_encoder.set_fragment_buffer(
             PathRasterizationInputIndex::Vertices as u64,
-            Some(&vertex_instance_bindings.buffer),
-            vertex_instance_bindings.offset as u64,
+            Some(&paths.vertices.buffer),
+            paths.vertices.offset as u64,
         );
-        command_encoder.draw_primitives(
-            metal::MTLPrimitiveType::Triangle,
-            0,
-            vertices.len() as u64,
-        );
+        command_encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, paths.vertex_count);
 
         command_encoder.end_encoding();
         Ok(true)
@@ -985,15 +1076,14 @@ impl MetalRenderer {
 
     fn draw_paths_from_intermediate(
         &self,
-        paths: &[Path<ScaledPixels>],
-        writer: &mut InstanceBufferWriter,
+        paths: &PathBindings,
         viewport_size: Viewport,
         command_encoder: &metal::RenderCommandEncoderRef,
         target: &clip::Target,
     ) -> Result<()> {
-        let Some(first_path) = paths.first() else {
+        if paths.vertex_count == 0 {
             return Ok(());
-        };
+        }
         let intermediate_texture = target
             .paths
             .as_ref()
@@ -1016,41 +1106,17 @@ impl MetalRenderer {
             Some(intermediate_texture),
         );
 
-        // When copying paths from the intermediate texture to the drawable,
-        // each pixel must only be copied once, in case of transparent paths.
-        //
-        // If all paths have the same draw order, then their bounds are all
-        // disjoint, so we can copy each path's bounds individually. If this
-        // batch combines different draw orders, we perform a single copy
-        // for a minimal spanning rect.
-        let sprites;
-        if paths.last().unwrap().order == first_path.order {
-            sprites = paths
-                .iter()
-                .map(|path| PathSprite {
-                    bounds: path.clipped_bounds(),
-                })
-                .collect();
-        } else {
-            let mut bounds = first_path.clipped_bounds();
-            for path in paths.iter().skip(1) {
-                bounds = bounds.union(&path.clipped_bounds());
-            }
-            sprites = vec![PathSprite { bounds }];
-        }
-
-        let sprite_instance_bindings = writer.write(&sprites)?;
         command_encoder.set_vertex_buffer(
             SpriteInputIndex::Sprites as u64,
-            Some(&sprite_instance_bindings.buffer),
-            sprite_instance_bindings.offset as u64,
+            Some(&paths.sprites.buffer),
+            paths.sprites.offset as u64,
         );
 
         command_encoder.draw_primitives_instanced(
             metal::MTLPrimitiveType::Triangle,
             0,
             6,
-            sprites.len() as u64,
+            paths.sprite_count,
         );
         Ok(())
     }
@@ -1477,6 +1543,13 @@ fn build_path_rasterization_pipeline_state(
 struct InstanceBinding {
     buffer: metal::Buffer,
     offset: usize,
+}
+
+struct PathBindings {
+    vertices: InstanceBinding,
+    vertex_count: u64,
+    sprites: InstanceBinding,
+    sprite_count: u64,
 }
 
 struct InstanceBindings {
